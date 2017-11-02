@@ -1,0 +1,5 @@
+gym_compete.egg-info/PKG-INFO
+gym_compete.egg-info/SOURCES.txt
+gym_compete.egg-info/dependency_links.txt
+gym_compete.egg-info/requires.txt
+gym_compete.egg-info/top_level.txt
