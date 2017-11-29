@@ -139,8 +139,6 @@ class CNNPolicyValue(Policy):
         self.zero_state = np.zeros(1)
 
 
-
-
 class LSTMPolicy(Policy):
     def __init__(self, scope, *, ob_space, ac_space, hiddens, reuse=False, normalize=False):
         self.recurrent = True

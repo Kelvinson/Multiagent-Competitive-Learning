@@ -46,6 +46,7 @@ class RunningMeanStd(object):
                 shape=shape,
                 initializer=tf.constant_initializer(epsilon),
                 name="sumsq", trainable=False)
+
             self._count = tf.get_variable(
                 dtype=tf.float32,
                 shape=(),
@@ -74,29 +75,56 @@ class PPO(object):
     def __init__(self, scope):
         with tf.variable_scope(scope):
             self.sess = tf.Session()
-            self.tfs = tf.placeholder(tf.float32, [None, S_DIM], 'state')
+            ob_shape = (137,) # it's a tuple of one element
+            ac_space = (8,)  # it is a tuple of one element
+            hiddens = [128, 128]
+            self.tfs = tf.placeholder(tf.float32, [None, None] + list(ob_shape), 'observation')
+            self.taken_action_ph = tf.placeholder(dtype=tf.float32, shape=[None, None, ac_space[0]],name="taken_action")
+
+            #first try to normalize the the observation
+            self.ret_rms = RunningMeanStd(scope = "retfilter")
+            self.ob_rms = RunningMeanStd(shape = ob_shape, scope="obsfilter")
+
+            obz = tf.clip_by_value((self.tfs - self.ob_rms.mean) / self.ob_rms.std, -5.0, 5.0)
+
+
+
             self.zero_state = []
             self.state_in_ph = []
-            # first try to normalize the the observation
-            # oops, I get it wrong here, I first write it ob_shape = (137,1)
-
-            ob_shape = (137,)
-            self.ob_rms = RunningMeanStd(shape=ob_shape, scope="obsfilter")
-            self.tfs = tf.clip_by_value((self.tfs  - self.ob_rms.mean) / self.ob_rms.std, -5.0, 5.0)
+            self.state_out = []
             # critic
             with tf.variable_scope('critic'):
-                l1 = tf.layers.dense(self.tfs, 100, tf.nn.relu)
-                self.v = tf.layers.dense(l1, 1)
+                last_out = obz
+                for hidden in hiddens[:-1]:
+                    last_out = tf.contrib.layers.fully_connected(last_out, hidden)
+
+                cell = tf.contrib.rnn.BasicLSTMCell(hiddens[-1], reuse=False)
+                size = cell.state_size
+                self.zero_state.append(np.zeros(size.c, dtype=np.float32))
+                self.zero_state.append(np.zeros(size.h, dtype=np.float32))
+                self.state_in_ph.append(tf.placeholder(tf.float32, [None, size.c], name="lstmv_c"))
+                self.state_in_ph.append(tf.placeholder(tf.float32, [None, size.h], name="lstmv_h"))
+                initial_state = tf.contrib.rnn.LSTMStateTuple(self.state_in_ph[-2], self.state_in_ph[-1])
+                last_out, state_out = tf.nn.dynamic_rnn(cell, last_out, initial_state=initial_state, scope="lstmv")
+                self.state_out.append(state_out)
+
+                self.vpredz = tf.contrib.layers.fully_connected(last_out, 1, activation_fn=None)[:, :, 0]
+                self.v = self.vpredz * self.ret_rms.std + self.ret_rms.mean  # raw = not standardized
+
+                # l1 = tf.layers.dense(self.tfs, 100, tf.nn.relu)
+                # self.v = tf.layers.dense(l1, 1)
+                #
+
                 self.tfdc_r = tf.placeholder(tf.float32, [None, 1], 'discounted_r')
                 self.advantage = self.tfdc_r - self.v
                 self.closs = tf.reduce_mean(tf.square(self.advantage))
                 self.ctrain_op = tf.train.AdamOptimizer(C_LR).minimize(self.closs)
 
             # actor
-            pi, pi_params = self._build_anet('pi', trainable=True)
-            oldpi, oldpi_params = self._build_anet('oldpi', trainable=False)
+            pi,pi_norm, pi_params = self._build_anet('pi', trainable=True)
+            oldpi, oldpi_normal, oldpi_params = self._build_anet('oldpi', trainable=False)
             with tf.variable_scope('sample_action'):
-                self.sample_op = tf.squeeze(pi.sample(1), axis=0)       # choosing action
+                self.sample_op = tf.squeeze(pi, axis=0)       # choosing action
             with tf.variable_scope('update_oldpi'):
                 self.update_oldpi_op = [oldp.assign(p) for p, oldp in zip(pi_params, oldpi_params)]
 
@@ -105,7 +133,8 @@ class PPO(object):
             with tf.variable_scope('loss'):
                 with tf.variable_scope('surrogate'):
                     # ratio = tf.exp(pi.log_prob(self.tfa) - oldpi.log_prob(self.tfa))
-                    ratio = pi.prob(self.tfa) / oldpi.prob(self.tfa)
+                    # ratio = tf.distributions.Normal.prob(self.tfa) / tf.distributions.Normal.prob(self.tfa)
+                    ratio = pi_norm.prob(self.tfa) / oldpi_normal.prob(self.tfa)
                     surr = ratio * self.tfadv
                 if METHOD['name'] == 'kl_pen':
                     self.tflam = tf.placeholder(tf.float32, None, 'lambda')
@@ -126,7 +155,7 @@ class PPO(object):
 
     def update(self, s, a, r):
         self.sess.run(self.update_oldpi_op)
-        adv = self.sess.run(self.advantage, {self.tfs: s, self.tfdc_r: r})
+        adv = self.sess.run(self.advantage, {self.tfs: s[None, None], self.tfdc_r: r})
         # adv = (adv - adv.mean())/(adv.std()+1e-6)     # sometimes helpful
 
         # update actor
@@ -134,7 +163,7 @@ class PPO(object):
             for _ in range(A_UPDATE_STEPS):
                 _, kl = self.sess.run(
                     [self.atrain_op, self.kl_mean],
-                    {self.tfs: s, self.tfa: a, self.tfadv: adv, self.tflam: METHOD['lam']})
+                    {self.tfs: s[None], self.tfa: a, self.tfadv: adv, self.tflam: METHOD['lam']})
                 if kl > 4*METHOD['kl_target']:  # this in in google's paper
                     break
             if kl < METHOD['kl_target'] / 1.5:  # adaptive lambda, this is in OpenAI's paper
@@ -143,36 +172,39 @@ class PPO(object):
                 METHOD['lam'] *= 2
             METHOD['lam'] = np.clip(METHOD['lam'], 1e-4, 10)    # some time explode, this is my method
         else:   # clipping method, find this is better (OpenAI's paper)
-            [self.sess.run(self.atrain_op, {self.tfs: s, self.tfa: a, self.tfadv: adv}) for _ in range(A_UPDATE_STEPS)]
+            [self.sess.run(self.atrain_op, {self.tfs: s[None], self.tfa: a, self.tfadv: adv}) for _ in range(A_UPDATE_STEPS)]
 
         # update critic
-        [self.sess.run(self.ctrain_op, {self.tfs: s, self.tfdc_r: r}) for _ in range(C_UPDATE_STEPS)]
+        [self.sess.run(self.ctrain_op, {self.tfs: s[None], self.tfdc_r: r}) for _ in range(C_UPDATE_STEPS)]
 
-    # ususally a method with an underscore "_" prefix means it is a private method to the class
     def _build_anet(self, name, trainable):
         with tf.variable_scope(name):
             hiddens = [128, 128]
+            obz = tf.clip_by_value((self.tfs - self.ob_rms.mean) / self.ob_rms.std, -5.0, 5.0)
 
-            last_out = tf.placeholder(tf.float32, [None, None] + list(self.tfs), name="observation" )
+            last_out = obz
             for hidden in hiddens[:-1]:
                 last_out = tf.contrib.layers.fully_connected(last_out, hidden)
             cell = tf.contrib.rnn.BasicLSTMCell(hiddens[-1], reuse=False)
             size = cell.state_size
             self.zero_state.append(np.zeros(size.c, dtype=np.float32))
             self.zero_state.append(np.zeros(size.h, dtype=np.float32))
+            # self.zero_state = np.concatenate(self.zero_state, np.zeros(size.c, dtype=np.float32))
+            # self.zero_state = np.concatenate(self.zero_state, np.zeros(size.h, dtype=np.float32))
             self.state_in_ph.append(tf.placeholder(tf.float32, [None, size.c], name="lstmp_c"))
             self.state_in_ph.append(tf.placeholder(tf.float32, [None, size.h], name="lstmp_h"))
+
             initial_state = tf.contrib.rnn.LSTMStateTuple(self.state_in_ph[-2], self.state_in_ph[-1])
-            print("type of last_out is",type(last_out))
-            print("last_out is ", last_out)
+            # print("type of last_out is",type(last_out))
+            # print("last_out is ", last_out)
             last_out, state_out = tf.nn.dynamic_rnn(cell, last_out, initial_state=initial_state, scope="lstmp")
             self.state_out.append(state_out)
 
-            mean = tf.contrib.layers.fully_connected(last_out, 137, activation_fn=None)
-            logstd = tf.get_variable(name="logstd", shape=[1, 137], initializer=tf.zeros_initializer())
+            self.mean = tf.contrib.layers.fully_connected(last_out, A_DIM, activation_fn=None)
+            self.logstd = tf.get_variable(name="logstd", shape=A_DIM, initializer=tf.zeros_initializer())
 
             # print("in the policy network, the mean and logstd is {} {}".format(mean, logstd))
-            pd = DiagonalGaussian(mean, logstd)
+            pd = DiagonalGaussian(self.mean, self.logstd)
             # print("in the policy network, the output pd is {}".format(self.pd))
 
             # def switch(condition, if_exp, else_exp):
@@ -180,18 +212,36 @@ class PPO(object):
             # first cast stochastic_ph to a bool value if it is true then sampled_action is pd.sample
             # else sampled_aciton is pd.mode
             # self.sampled_action = switch(self.stochastic_ph, self.pd.sample(), self.pd.mode())
-            sampled_action = pd.mean + self.std * tf.random_normal(tf.shape(pd.mean))
+            sampled_action = pd.mean + pd.std * tf.random_normal(tf.shape(pd.mean))
 
+            # to make it consistent with the original code
+            norm_dist = tf.distributions.Normal(loc=self.mean, scale=self.logstd)
             # l1 = tf.layers.dense(self.tfs, 100, tf.nn.relu, trainable=trainable)
             # mu = 2 * tf.layers.dense(l1, A_DIM, tf.nn.tanh, trainable=trainable)
             # sigma = tf.layers.dense(l1, A_DIM, tf.nn.softplus, trainable=trainable)
             # norm_dist = tf.distributions.Normal(loc=mu, scale=sigma)
             params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=name)
-            return sampled_action, params
+            self.zero_state = np.array(self.zero_state)
+            self.state_in_ph = tuple(self.state_in_ph)
+            self.state = self.zero_state
+            return sampled_action, norm_dist, params
 
     def choose_action(self, s):
-        s = s[np.newaxis, :]
-        a = self.sess.run(self.sample_op, {self.tfs: s})[0]
+        outputs = [self.sample_op, self.state_out]
+        a, s = tf.get_default_session().run(outputs, {
+            self.tfs: s[None, None],
+            self.state_in_ph: list(self.state[:, None, :])
+        })
+
+        self.state  = []
+        for x in s:
+            self.state.append(x.c[0])
+            self.state.append(x.h[0])
+        self.state = np.array(self.state)
+        # s = s[np.newaxis, :]
+        # a = self.sess.run(self.sample_op, {self.tfs: s[None], self.state_in_ph: list(self.state[:, None,:])})
+        # self.state = []
+        # for x in
         # return np.clip(a, -2, 2)
         return a
 
@@ -243,7 +293,7 @@ for ep in range(EP_MAX):
             exploration_reward = info[i]['reward_move'] * (1 - t*0.002)
             competition_reward = info[i]['reward_remaining'] * t * 0.002
             rewrd= exploration_reward + competition_reward
-            buffer_r[i].append((rewrd+8)/8)    # normalize reward, find to be useful
+            # buffer_r[i].append((rewrd+8)/8)    # normalize reward, find to be useful
             ep_r[i] += rewrd
 
         print("At step {} in episode {} reward for two agents are {} and  {} respectively".format(t, ep, ep_r[0], ep_r[1]))

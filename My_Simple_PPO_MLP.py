@@ -33,41 +33,6 @@ METHOD = [
     dict(name='clip', epsilon=0.2),                 # Clipped surrogate objective, find this is better
 ][1]        # choose the method for optimization
 
-class RunningMeanStd(object):
-    def __init__(self, scope= "running", reuse=False, epsilon=1e-2, shape=()):
-        with tf.variable_scope(scope, reuse=reuse):
-            self._sum = tf.get_variable(
-                dtype=tf.float32,
-                shape=shape,
-                initializer=tf.constant_initializer(0.0),
-                name="sum", trainable=False)
-            self._sumsq = tf.get_variable(
-                dtype=tf.float32,
-                shape=shape,
-                initializer=tf.constant_initializer(epsilon),
-                name="sumsq", trainable=False)
-            self._count = tf.get_variable(
-                dtype=tf.float32,
-                shape=(),
-                initializer=tf.constant_initializer(epsilon),
-                name="count", trainable=False)
-            self.shape = shape
-            self.mean = tf.to_float(self._sum / self._count)
-            var_est = tf.to_float(self._sumsq / self._count) - tf.square(self.mean)
-            self.std = tf.sqrt(tf.maximum(var_est, 1e-2))
-
-
-class DiagonalGaussian(object):
-    def __init__(self, mean, logstd):
-        self.mean = mean
-        self.logstd = logstd
-        self.std = tf.exp(logstd)
-
-    def sample(self):
-        return self.mean + self.std * tf.random_normal(tf.shape(self.mean))
-
-    def mode(self):
-        return self.mean
 
 class PPO(object):
 
@@ -75,14 +40,7 @@ class PPO(object):
         with tf.variable_scope(scope):
             self.sess = tf.Session()
             self.tfs = tf.placeholder(tf.float32, [None, S_DIM], 'state')
-            self.zero_state = []
-            self.state_in_ph = []
-            # first try to normalize the the observation
-            # oops, I get it wrong here, I first write it ob_shape = (137,1)
 
-            ob_shape = (137,)
-            self.ob_rms = RunningMeanStd(shape=ob_shape, scope="obsfilter")
-            self.tfs = tf.clip_by_value((self.tfs  - self.ob_rms.mean) / self.ob_rms.std, -5.0, 5.0)
             # critic
             with tf.variable_scope('critic'):
                 l1 = tf.layers.dense(self.tfs, 100, tf.nn.relu)
@@ -148,46 +106,14 @@ class PPO(object):
         # update critic
         [self.sess.run(self.ctrain_op, {self.tfs: s, self.tfdc_r: r}) for _ in range(C_UPDATE_STEPS)]
 
-    # ususally a method with an underscore "_" prefix means it is a private method to the class
     def _build_anet(self, name, trainable):
         with tf.variable_scope(name):
-            hiddens = [128, 128]
-
-            last_out = tf.placeholder(tf.float32, [None, None] + list(self.tfs), name="observation" )
-            for hidden in hiddens[:-1]:
-                last_out = tf.contrib.layers.fully_connected(last_out, hidden)
-            cell = tf.contrib.rnn.BasicLSTMCell(hiddens[-1], reuse=False)
-            size = cell.state_size
-            self.zero_state.append(np.zeros(size.c, dtype=np.float32))
-            self.zero_state.append(np.zeros(size.h, dtype=np.float32))
-            self.state_in_ph.append(tf.placeholder(tf.float32, [None, size.c], name="lstmp_c"))
-            self.state_in_ph.append(tf.placeholder(tf.float32, [None, size.h], name="lstmp_h"))
-            initial_state = tf.contrib.rnn.LSTMStateTuple(self.state_in_ph[-2], self.state_in_ph[-1])
-            print("type of last_out is",type(last_out))
-            print("last_out is ", last_out)
-            last_out, state_out = tf.nn.dynamic_rnn(cell, last_out, initial_state=initial_state, scope="lstmp")
-            self.state_out.append(state_out)
-
-            mean = tf.contrib.layers.fully_connected(last_out, 137, activation_fn=None)
-            logstd = tf.get_variable(name="logstd", shape=[1, 137], initializer=tf.zeros_initializer())
-
-            # print("in the policy network, the mean and logstd is {} {}".format(mean, logstd))
-            pd = DiagonalGaussian(mean, logstd)
-            # print("in the policy network, the output pd is {}".format(self.pd))
-
-            # def switch(condition, if_exp, else_exp):
-            # if stochastic is true then return sampled pd else return pd.mode()
-            # first cast stochastic_ph to a bool value if it is true then sampled_action is pd.sample
-            # else sampled_aciton is pd.mode
-            # self.sampled_action = switch(self.stochastic_ph, self.pd.sample(), self.pd.mode())
-            sampled_action = pd.mean + self.std * tf.random_normal(tf.shape(pd.mean))
-
-            # l1 = tf.layers.dense(self.tfs, 100, tf.nn.relu, trainable=trainable)
-            # mu = 2 * tf.layers.dense(l1, A_DIM, tf.nn.tanh, trainable=trainable)
-            # sigma = tf.layers.dense(l1, A_DIM, tf.nn.softplus, trainable=trainable)
-            # norm_dist = tf.distributions.Normal(loc=mu, scale=sigma)
-            params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=name)
-            return sampled_action, params
+            l1 = tf.layers.dense(self.tfs, 100, tf.nn.relu, trainable=trainable)
+            mu = 2 * tf.layers.dense(l1, A_DIM, tf.nn.tanh, trainable=trainable)
+            sigma = tf.layers.dense(l1, A_DIM, tf.nn.softplus, trainable=trainable)
+            norm_dist = tf.distributions.Normal(loc=mu, scale=sigma)
+        params = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=name)
+        return norm_dist, params
 
     def choose_action(self, s):
         s = s[np.newaxis, :]
@@ -223,28 +149,13 @@ for ep in range(EP_MAX):
         # just save a in a temple tuple variable a2tuple
         a2tuple = tuple(a)
         # the returned state info s_, rewared r, done info done are all tuple of two
-        s_, r, done, info = env.step(a2tuple)
-
+        s_, r, done, _ = env.step(a2tuple)
         for i in range(len1):
-
 
             buffer_s[i].append(s[i])
             buffer_a[i].append(a[i])
-            # exploration_reward = r[i][0] * (1-t * 0.002)
-            # if t == EP_LEN -1:
-            #     competition_reward = r[i][1] * t * 0.002
-            # else :
-            #     competition_reward = 0
-            # r[i] = exploration_reward + competition_reward
-            # center_reward = info['reward_center']
-            # ctrl_cost = info['reward_ctrl']
-            # contact_cost  = info['reward_contact']
-            # survive = info['reward_survive']
-            exploration_reward = info[i]['reward_move'] * (1 - t*0.002)
-            competition_reward = info[i]['reward_remaining'] * t * 0.002
-            rewrd= exploration_reward + competition_reward
-            buffer_r[i].append((rewrd+8)/8)    # normalize reward, find to be useful
-            ep_r[i] += rewrd
+            buffer_r[i].append((r[i]+8)/8)    # normalize reward, find to be useful
+            ep_r[i] += r[i]
 
         print("At step {} in episode {} reward for two agents are {} and  {} respectively".format(t, ep, ep_r[0], ep_r[1]))
         s = s_
@@ -277,7 +188,7 @@ for ep in range(EP_MAX):
                 bs, ba, br= np.vstack(buffer_s[i]), np.vstack(buffer_a[i]), np.array(discounted_r[i])[:, np.newaxis]
                 # buffer_s, buffer_a, buffer_r = [[] for i in range(len1)], [[] for i in range(len1)], [[] for i in range(len1)]
                 bs = (bs - np.mean(bs)) / (np.std(bs))
-                # bs = np.clip(bs, -5.0, 5.0)
+                bs = np.clip(bs, -5.0, 5.0)
 
 
                 buffer_s[i], buffer_a[i], buffer_r[i] = [], [], []

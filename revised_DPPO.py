@@ -28,9 +28,9 @@ C_LR = 0.0002  # learning rate for critic
 MIN_BATCH_SIZE = 64  # minimum batch size for updating PPO
 UPDATE_STEP = 10  # loop update operation n-steps
 EPSILON = 0.2  # for clipping surrogate objective
-GAME = 'Pendulum-v0'
-S_DIM, A_DIM = 3, 1  # state and action dimension
-
+GAME = 'sumo-ants-v0'
+# S_DIM, A_DIM = 3, 1  # state and action dimension
+S_DIM, A_DIM = 137, 8
 
 class PPO(object):
     def __init__(self):
@@ -178,9 +178,9 @@ if __name__ == '__main__':
     plt.plot(np.arange(len(GLOBAL_RUNNING_R)), GLOBAL_RUNNING_R)
     plt.xlabel('Episode');
     plt.ylabel('Moving reward');
-    plt.ion();
+    # plt.ion();
     plt.show()
-    env = gym.make('Pendulum-v0')
+    env = gym.make('sumo-ants-v0')
     while True:
         s = env.reset()
         for t in range(300):

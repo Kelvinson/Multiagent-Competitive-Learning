@@ -149,7 +149,9 @@ class MultiAgentEnv(Env):
         rews = []
         for i, info in enumerate(infos):
             info['reward_remaining'] = float(goal_rews[i])
-            rews.append(float(goal_rews[i] + self.move_reward_weight * move_rews[i]))
+            # rews.append(float(goal_rews[i] + self.move_reward_weight * move_rews[i]))
+            rews.append(tuple((float(move_rews[i]), float(goal_rews[i]))))
+            print("The exploration reward and competition reward is {} and {}".format(float(move_rews[i]),float(goal_rews[i])))
         rews = tuple(rews)
         done = self._get_done(dones, game_done)
         infos = tuple(infos)
